@@ -1,0 +1,1 @@
+self.onmessage=async t=>{const e=t.data;if(e.type==="cancel"){self.postMessage({type:"cancelled"});return}const s="Captions from speech are coming to this editor soon.";e.type==="init"?self.postMessage({type:"init-error",error:s}):self.postMessage({type:"transcribe-error",error:s})};

@@ -1,0 +1,1 @@
+import{_ as r}from"./preload-helper-PPVm8Dsz.js";var e={type:"sync",importFFI:()=>r(()=>import("./ffi-DlhRHxHv.js"),[],import.meta.url).then(t=>t.QuickJSFFI),importModuleLoader:()=>r(()=>import("./emscripten-module.browser-Chm0IXqX.js"),[],import.meta.url).then(t=>t.default)},_=e;export{_ as default};

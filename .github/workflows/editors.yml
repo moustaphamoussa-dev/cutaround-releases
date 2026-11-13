@@ -1,0 +1,273 @@
+name: Editors (Windows + Intel Mac)
+
+# Builds the native editors the desktop app installs (desktop/editors.cjs) for the systems this
+# Mac can't build: CutDeck (editors/cut, a FilmCraft fork) and CutEffect (editors/motion, an
+# EffectCraft fork) for Windows x64, and, when asked, for Intel Macs. Each package goes through
+# desktop/test/editors-smoke.cjs on the runner (install, launch with a control port, new project,
+# frame, save, read back), then lands on the "editors" release of the releases repository with
+# a platform-named asset (cutdeck-windows-x64.zip …). That release is never marked latest.
+#
+# The Windows build follows each upstream's packaging/windows/package.ps1 (static C runtime, the
+# icon and version resource required, PE header checks) but ships a zip in CutAround's layout
+# instead of their FilmCraft/EffectCraft-branded MSI: CutDeck/CutDeck.exe, CutEffect/CutEffect.exe.
+#
+# This file runs unchanged in Kakaymi10/glisse or in moustaphamoussa-dev/cutaround-releases:
+#   secrets.GLISSE_SOURCE_TOKEN  read access to Kakaymi10/glisse (only needed outside glisse)
+#   secrets.RELEASES_TOKEN       write access to cutaround-releases (only needed outside it)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "glisse branch, tag or commit to build"
+        type: string
+        default: main
+      editors:
+        description: "Which editors"
+        type: choice
+        options: [both, cutdeck, cuteffect]
+        default: both
+      windows:
+        description: "Windows x64"
+        type: boolean
+        default: true
+      mac_intel:
+        description: "Intel Mac (x64; macOS runner minutes cost 10x on a private repository)"
+        type: boolean
+        default: false
+      publish:
+        description: "Upload to the editors release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: editors-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Kakaymi10/glisse
+  RELEASES_REPO: moustaphamoussa-dev/cutaround-releases
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: python
+        env:
+          EDITORS: ${{ inputs.editors }}
+          WINDOWS: ${{ inputs.windows }}
+          MAC_INTEL: ${{ inputs.mac_intel }}
+        run: |
+          import json, os
+          editors = {
+            "cutdeck":   {"id": "cut",    "dir": "editors/cut",    "pkg": "filmcraft",   "name": "CutDeck",
+                          "prefix": "FILMCRAFT",   "features": "filmcraft/neural-voices,filmcraft/whisper"},
+            "cuteffect": {"id": "motion", "dir": "editors/motion", "pkg": "effectcraft", "name": "CutEffect",
+                          "prefix": "EFFECTCRAFT", "features": ""},
+          }
+          want = list(editors) if os.environ["EDITORS"] == "both" else [os.environ["EDITORS"]]
+          inc = []
+          for key in want:
+            e = dict(editors[key], editor=key)
+            if os.environ["WINDOWS"] == "true":
+              inc.append(dict(e, os="windows", arch="x64", runner="windows-latest", target="x86_64-pc-windows-msvc"))
+            if os.environ["MAC_INTEL"] == "true":
+              # Cross-compiled on the Apple Silicon runner: faster than the Intel ones.
+              inc.append(dict(e, os="macos", arch="x64", runner="macos-14", target="x86_64-apple-darwin"))
+          if not inc:
+            raise SystemExit("nothing to build: choose Windows and/or Intel Mac")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write("matrix=" + json.dumps({"include": inc}) + "\n")
+          print(json.dumps(inc, indent=1))
+
+  build:
+    needs: plan
+    name: ${{ matrix.name }} ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      ASSET: ${{ matrix.editor }}-${{ matrix.os }}-${{ matrix.arch }}.zip
+    steps:
+      # Windows runners check out with CRLF by default; the Rust crates include_str! text files
+      # (translations, shaders, fixtures) and expect them as committed.
+      - run: git config --global core.autocrlf false
+
+      - name: Source access
+        shell: bash
+        env:
+          HAS_TOKEN: ${{ secrets.GLISSE_SOURCE_TOKEN != '' }}
+        run: |
+          if [ "${{ github.repository }}" != "$SOURCE_REPO" ] && [ "$HAS_TOKEN" != true ]; then
+            echo "::error::add the GLISSE_SOURCE_TOKEN secret (read-only Contents on $SOURCE_REPO) to ${{ github.repository }}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GLISSE_SOURCE_TOKEN || github.token }}
+          persist-credentials: false
+          sparse-checkout: |
+            ${{ matrix.dir }}
+            desktop/editors.cjs
+            desktop/test
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.dir }} -> target
+          key: ${{ matrix.target }}
+
+      - name: Build information
+        shell: bash
+        working-directory: ${{ matrix.dir }}
+        run: |
+          version=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)
+          sha=$(git rev-parse HEAD)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "${{ matrix.prefix }}_BUILD_SHA=$sha" >> "$GITHUB_ENV"
+          echo "${{ matrix.prefix }}_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+          echo "${{ matrix.name }} $version ($sha) for ${{ matrix.target }}"
+
+      # The .exe's icon: CutAround's, not upstream's (their brand terms; the Mac bundle already
+      # wears CutAround's icns). Made from the same PNGs at build time.
+      - name: CutAround icon for the .exe
+        if: matrix.os == 'windows'
+        shell: bash
+        working-directory: ${{ matrix.dir }}
+        run: |
+          python -m pip install --quiet pillow
+          python - <<'EOF'
+          from PIL import Image
+          src = Image.open("assets/cutaround/icon-256.png").convert("RGBA")
+          src.save("assets/app-icon/${{ matrix.pkg }}.ico", sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          print("wrote assets/app-icon/${{ matrix.pkg }}.ico")
+          EOF
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        working-directory: ${{ matrix.dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # As upstream's package.ps1: static C runtime (no VC++ redistributable), and fail rather
+          # than ship an .exe without its icon and version resource.
+          # -A warnings: this runs in a public repository, so the log shows no source lines from
+          # lint warnings (errors still print, to fix them).
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static -A warnings'
+          [Environment]::SetEnvironmentVariable('${{ matrix.prefix }}_REQUIRE_WINRES', '1')
+          $features = @()
+          if ('${{ matrix.features }}') { $features = @('--features', '${{ matrix.features }}') }
+          cargo build --release --locked -p ${{ matrix.pkg }} -p ${{ matrix.pkg }}-cli @features --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        working-directory: ${{ matrix.dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "target/${{ matrix.target }}/release"
+          # PE checks from package.ps1: x64, the app a GUI program (no console window), the CLI a console one.
+          function Get-PeHeader([string] $Path) {
+            $b = [IO.File]::ReadAllBytes($Path); $pe = [BitConverter]::ToInt32($b, 0x3C)
+            @{ Machine = [BitConverter]::ToUInt16($b, $pe + 4); Subsystem = [BitConverter]::ToUInt16($b, $pe + 0x5C) }
+          }
+          foreach ($c in @(@('${{ matrix.pkg }}.exe', 2), @('${{ matrix.pkg }}-cli.exe', 3))) {
+            $h = Get-PeHeader (Join-Path $bin $c[0])
+            if ($h.Machine -ne 0x8664) { throw "$($c[0]) is not x64" }
+            if ($h.Subsystem -ne $c[1]) { throw "$($c[0]) has PE subsystem $($h.Subsystem), expected $($c[1])" }
+            Write-Output "ok $($c[0])"
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'pkg'
+          $stage = Join-Path $out '${{ matrix.name }}'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item (Join-Path $bin '${{ matrix.pkg }}.exe') (Join-Path $stage '${{ matrix.name }}.exe')
+          Copy-Item (Join-Path $bin '${{ matrix.pkg }}-cli.exe') $stage
+          foreach ($f in 'NOTICE', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'CUTAROUND.md') { if (Test-Path $f) { Copy-Item $f $stage } }
+          # No portable.txt: settings live in %APPDATA% like any installed app, and survive updates.
+          Set-Content -NoNewline -Encoding ascii (Join-Path $stage 'VERSION') $env:VERSION
+          Push-Location $out
+          7z a -tzip -mx=9 (Join-Path $env:GITHUB_WORKSPACE $env:ASSET) '${{ matrix.name }}' | Out-Null
+          Pop-Location
+          Get-Item (Join-Path $env:GITHUB_WORKSPACE $env:ASSET) | Format-Table Name, Length
+          & (Join-Path $stage '${{ matrix.pkg }}-cli.exe') --version
+
+      - name: Build and package (Intel Mac)
+        if: matrix.os == 'macos'
+        shell: bash
+        working-directory: ${{ matrix.dir }}
+        run: |
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS="-A warnings"
+          packaging/macos/package.sh --arch x86_64 --app-only
+          ditto -c -k --keepParent "target/macos-package/${{ matrix.name }}.app" "$GITHUB_WORKSPACE/$ASSET"
+          ls -la "$GITHUB_WORKSPACE/$ASSET"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The desktop app's own code installs and drives the package. The Intel build runs under
+      # Rosetta on this Apple Silicon runner.
+      - name: Smoke test with desktop/editors.cjs
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          if [ "${{ matrix.os }}" = macos ]; then softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true; fi
+          node desktop/test/editors-smoke.cjs ${{ matrix.id }} "$ASSET"
+
+      # Only a package that passed the smoke test reaches the release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          # Only the built app is uploaded, and it is gone after a day (the release keeps the copy).
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: ${{ inputs.publish && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Upload to the editors release (not latest)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+        run: |
+          shopt -s nullglob
+          files=(assets/*.zip)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::no package was built"; exit 1; fi
+          if [ "${{ github.repository }}" != "$RELEASES_REPO" ] && [ -z "${{ secrets.RELEASES_TOKEN }}" ]; then
+            echo "::error::set the RELEASES_TOKEN secret (contents: write on $RELEASES_REPO) to publish from ${{ github.repository }}"
+            exit 1
+          fi
+          ls -la assets
+          gh release upload editors "${files[@]}" --clobber -R "$RELEASES_REPO"
+          names=$(gh release view editors -R "$RELEASES_REPO" --json assets -q '[.assets[].name] | join(" ")')
+          notes="The editors the CutAround desktop app installs from its Editors page: CutEffect, the After Effects-style editor, and CutDeck, the Premiere Pro-style editor.
+
+          Systems: macOS (Apple Silicon$( [[ $names == *macos-x64* ]] && echo ' and Intel')) and Windows x64 (Windows on Arm runs the x64 build). The app picks the right file; these aren't meant to be downloaded by hand."
+          gh release edit editors -R "$RELEASES_REPO" --notes "$notes" --latest=false
+          for f in "${files[@]}"; do echo "https://github.com/$RELEASES_REPO/releases/download/editors/$(basename "$f")"; done

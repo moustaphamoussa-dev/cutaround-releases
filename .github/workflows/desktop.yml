@@ -1,0 +1,164 @@
+name: Desktop app (Windows + Intel Mac)
+
+# Builds the CutAround desktop app (desktop/, Electron) the way `npm run dist:win` does on the
+# Mac — web build, Claude Desktop extension, electron-builder, verify.cjs — on a Windows runner,
+# then installs it silently and starts it once to check it opens. The installer keeps its fixed
+# name (CutAround-win-x64.exe) and goes to the release the download page and the app's update
+# check read: by default the current latest release (/releases/latest/download/… links), or
+# the tag given.
+#
+# Runs unchanged in Kakaymi10/glisse or moustaphamoussa-dev/cutaround-releases:
+#   secrets.GLISSE_SOURCE_TOKEN  read access to Kakaymi10/glisse (only needed outside glisse)
+#   secrets.RELEASES_TOKEN       write access to cutaround-releases (only needed outside it)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "glisse branch, tag or commit to build"
+        type: string
+        default: main
+      mac:
+        description: "Also build the Mac DMGs (Apple Silicon + Intel; macOS minutes cost 10x on a private repository)"
+        type: boolean
+        default: false
+      publish:
+        description: "Upload the installer(s) to the release"
+        type: boolean
+        default: true
+      release_tag:
+        description: "Release to upload to (empty: the current latest release)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Kakaymi10/glisse
+  RELEASES_REPO: moustaphamoussa-dev/cutaround-releases
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.mac && '[{"name":"Windows x64","os":"windows","runner":"windows-latest","builder":"--win --x64"},{"name":"Mac","os":"mac","runner":"macos-14","builder":"--mac"}]' || '[{"name":"Windows x64","os":"windows","runner":"windows-latest","builder":"--win --x64"}]') }}
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - name: Source access
+        shell: bash
+        env:
+          HAS_TOKEN: ${{ secrets.GLISSE_SOURCE_TOKEN != '' }}
+        run: |
+          if [ "${{ github.repository }}" != "$SOURCE_REPO" ] && [ "$HAS_TOKEN" != true ]; then
+            echo "::error::add the GLISSE_SOURCE_TOKEN secret (read-only Contents on $SOURCE_REPO) to ${{ github.repository }}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GLISSE_SOURCE_TOKEN || github.token }}
+          persist-credentials: false
+          sparse-checkout: |
+            desktop
+            frontend
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install
+        shell: bash
+        run: |
+          (cd frontend && npm ci --no-audit --no-fund)
+          (cd desktop && npm ci --no-audit --no-fund)
+
+      - name: Build
+        shell: bash
+        working-directory: desktop
+        env:
+          # No signing identity here: unsigned, as the Mac builds made by hand are.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          # npm run web, with only errors in the log (it is public in cutaround-releases).
+          (cd ../frontend && npx vite build --mode desktop --logLevel error)
+          npm run mcpb
+          npx electron-builder ${{ matrix.builder }} --publish never
+          node verify.cjs
+          ls -la release
+
+      # Install the way a person would (silently here), start it, and check its log says it ran.
+      - name: Install and start (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Resolve-Path desktop/release/CutAround-win-x64.exe
+          $dir = Join-Path $env:RUNNER_TEMP 'CutAround'
+          $p = Start-Process -FilePath $exe -ArgumentList '/S', "/D=$dir" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+          $app = Join-Path $dir 'CutAround.exe'
+          if (-not (Test-Path $app)) { Get-ChildItem -Recurse $dir | Select-Object -First 40 FullName; throw "no CutAround.exe in $dir" }
+          $proc = Start-Process -FilePath $app -PassThru
+          $log = Join-Path $env:APPDATA 'Glisse\logs\main.log'
+          for ($i = 0; $i -lt 60 -and -not (Test-Path $log); $i++) { Start-Sleep 1 }
+          Start-Sleep 8
+          if (-not (Test-Path $log)) { throw "the app wrote no log at $log" }
+          Get-Content $log -Tail 40
+          $alive = -not $proc.HasExited
+          Get-Process CutAround -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not $alive) { throw "CutAround exited on its own (code $($proc.ExitCode))" }
+          if (-not (Select-String -Path $log -Pattern 'start: CutAround' -Quiet)) { throw "the log has no start line" }
+          Write-Output "CutAround started and stayed up"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: |
+            desktop/release/CutAround-*.exe
+            desktop/release/CutAround-*.dmg
+          if-no-files-found: error
+          # Only the built app is uploaded, and it is gone after a day (the release keeps the copy).
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "${{ github.repository }}" != "$RELEASES_REPO" ] && [ -z "${{ secrets.RELEASES_TOKEN }}" ]; then
+            echo "::error::set the RELEASES_TOKEN secret (contents: write on $RELEASES_REPO) to publish from ${{ github.repository }}"
+            exit 1
+          fi
+          [ -n "$TAG" ] || TAG=$(gh release view -R "$RELEASES_REPO" --json tagName -q .tagName)
+          echo "release: $TAG"
+          ls -la assets
+          gh release upload "$TAG" assets/CutAround-* --clobber -R "$RELEASES_REPO"
+          for f in assets/CutAround-*; do echo "https://github.com/$RELEASES_REPO/releases/download/$TAG/$(basename "$f")"; done

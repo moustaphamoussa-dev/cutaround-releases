@@ -26,6 +26,10 @@ on:
         type: choice
         options: [x64, arm64, both]
         default: x64
+      smoke:
+        description: "Run the stream image on the runner and drive it from headless Chrome (screenshots artifact)"
+        type: boolean
+        default: true
       push_image:
         description: "Also build and push ghcr.io/<owner>/cutaround-stream (cpu + nvidia tags, x64)"
         type: boolean
@@ -107,6 +111,67 @@ jobs:
           path: out/
           retention-days: 7
 
+  # The image on the runner (Mesa, no GPU), the editor streamed into headless Chromium: the page
+  # signs in, the window plays as video, a click and keys reach it, the agent saves. Screenshots
+  # and container logs are the artifact cloud-stream-smoke-<arch>.
+  smoke:
+    needs: [plan, engines]
+    if: ${{ inputs.smoke }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(needs.plan.outputs.archs) }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Kakaymi10/glisse
+          token: ${{ secrets.GLISSE_SOURCE_TOKEN || github.token }}
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            editors/cloud-stream
+            editors/cloud-runner
+      - uses: actions/download-artifact@v4
+        with:
+          name: cloud-stream-engines-${{ matrix.arch }}
+          path: editors/cloud-stream/bin
+      - name: Build the image (prebuilt engines)
+        run: docker build -f editors/cloud-stream/Dockerfile --build-arg ENGINES=prebuilt -t cutaround-stream .
+      - name: Start a session (CutDeck, new project)
+        run: |
+          docker run -d --name stream --shm-size=1g -p 8080:8080 -p 8091:8091 \
+            -p 59000:59000/udp -p 59000:59000/tcp \
+            -e STREAM_PASSWORD=dev -e STREAM_TOKEN=dev -e STREAM_EDITOR=cutdeck \
+            -e STREAM_PUBLIC_IP=127.0.0.1 -e STREAM_SCREEN=1600x900@30 cutaround-stream
+          for _ in $(seq 1 120); do
+            h=$(curl -s http://127.0.0.1:8091/health || true); echo "$h"
+            case "$h" in *'"ready": true'*) exit 0 ;; *'"error": "'*) exit 1 ;; esac
+            sleep 2
+          done
+          exit 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Drive it from a browser
+        run: |
+          mkdir -p /tmp/pw && cd /tmp/pw && npm init -y >/dev/null && npm i playwright@1 >/dev/null
+          npx playwright install --with-deps chromium >/dev/null
+          cp "$GITHUB_WORKSPACE/editors/cloud-stream/smoke.mjs" /tmp/pw/smoke.mjs
+          node /tmp/pw/smoke.mjs http://127.0.0.1:8080 http://127.0.0.1:8091 "$GITHUB_WORKSPACE/shots"
+      - name: Container logs
+        if: always()
+        run: |
+          mkdir -p shots
+          docker logs stream > shots/container.log 2>&1 || true
+          docker exec stream sh -c 'tail -n 200 /var/log/neko/*.log' > shots/neko-logs.txt 2>&1 || true
+          tail -n 60 shots/container.log; tail -n 80 shots/neko-logs.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cloud-stream-smoke-${{ matrix.arch }}
+          path: shots/
+          retention-days: 7
+
   image:
     needs: engines
     if: ${{ inputs.push_image }}
@@ -143,6 +208,6 @@ jobs:
           file: editors/cloud-stream/Dockerfile
           build-args: |
             ENGINES=prebuilt
-            BASE_IMAGE=ghcr.io/m1k1o/neko/nvidia-base:3
+            BASE_IMAGE=ghcr.io/m1k1o/neko/nvidia-base:3.2
           push: true
           tags: ${{ steps.n.outputs.repo }}:nvidia

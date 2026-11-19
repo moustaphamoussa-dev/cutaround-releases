@@ -65,13 +65,16 @@
     addEventListener("unhandledrejection", (ev) => { if (window.filmcraftLoad.readyMs && isFatal(ev.reason)) window.filmcraftFatal(ev.reason); });
   </script>
   <script type="module">
-    // `f0a69a9578e9c256` is replaced by `cargo xtask web` with a hash of the build: the glue and the
+    // `3209d98714b8c1ea` is replaced by `cargo xtask web` with a hash of the build: the glue and the
     // wasm are cached as immutable, so their URLs must change with every build.
-    const build = "f0a69a9578e9c256";
+    const build = "3209d98714b8c1ea";
     const v = build.startsWith("__") ? "" : "?v=" + build;
     const t0 = performance.now();
     const params = new URLSearchParams(location.search);
     try {
+      // frame workers load the same build (src/frameworkers.rs)
+      window.filmcraftLoad.glue = new URL("./filmcraft_web.js" + v, location.href).href;
+      window.filmcraftLoad.wasm = new URL("filmcraft_web_bg.wasm" + v, location.href).href;
       const { default: init, start } = await import("./filmcraft_web.js" + v);
       await init({ module_or_path: new URL("filmcraft_web_bg.wasm" + v, location.href) });
       window.filmcraftLoad.wasmMs = performance.now() - t0;
